@@ -1,0 +1,222 @@
+import Foundation
+import StoreKit
+
+typealias SuccessCallBack = () -> Void
+
+class IAPManager: NSObject {
+    static let shared = IAPManager()
+    
+    var isPlanLoaded = false
+    var isFromPromotion = false
+    private var alertController: AlertController?
+    private var availablePlans: [SKProduct] = []
+    
+    private override init() {
+        super.init()
+    }
+    
+    // Call when app launch to handle the pending transaction
+    func setupIAP() {
+        SwiftyStoreKit.completeTransactions(atomically: true) { purchases in
+            for purchase in purchases {
+                switch purchase.transaction.transactionState {
+                case .purchased, .restored:
+                    DispatchQueue.main.async {
+                        if self.isFromPromotion {
+                            self.isFromPromotion = false
+                            self.verifyReceipts(success: { }, failure: { _ in })
+                        }
+                    }
+                    if purchase.needsFinishTransaction {
+                        // Deliver content from server, then:
+                        SwiftyStoreKit.finishTransaction(purchase.transaction)
+                    }
+                case .failed, .purchasing, .deferred:
+                    break // Handle these cases as appropriate
+                @unknown default:
+                    break
+                }
+            }
+        }
+        
+        SwiftyStoreKit.shouldAddStorePaymentHandler = { payment, product in
+            self.isFromPromotion = true
+            return true
+        }
+    }
+    
+    // Get list prodcut/plans from the apple
+    func requestProducts(withIdentifiers identifiers: Set<String>, onCompletion: @escaping () -> Void) {
+        SwiftyStoreKit.retrieveProductsInfo(identifiers) { result in
+            if let _ = result.error {
+                onCompletion()
+                IAPManager.shared.isPlanLoaded = false
+                return
+            }
+            
+            if result.invalidProductIDs.count > 0 {
+                for invalidProductId in result.invalidProductIDs {
+                    debugPrint("invalidProductId: \(invalidProductId)")
+                }
+            }
+            
+            if result.retrievedProducts.count > 0  {
+                IAPManager.shared.isPlanLoaded = true
+                self.availablePlans.append(contentsOf: result.retrievedProducts)
+            }
+            onCompletion()
+        }
+    }
+    
+    // When user click on the purchase
+    func purchaseSubscription(productId: String, success: @escaping SuccessCallBack, failure: @escaping ErrorCallBack) {
+        SwiftyStoreKit.purchaseProduct(productId, atomically: true) { result in
+            switch result {
+            case .success(let purchase):
+                debugPrint("Purchase Success: \(purchase.productId)")
+                debugPrint("Transaction Id: \(purchase.transaction.transactionIdentifier ?? "")")
+                UserManager.shared.setPlanId(productId: purchase.productId)
+                self.verifyReceipts(success: {
+                    if purchase.needsFinishTransaction {
+                        SwiftyStoreKit.finishTransaction(purchase.transaction)
+                    }
+                    success()
+                }, failure: { error in
+                    failure(error)
+                })
+            case .error(let error):
+                debugPrint("Error: \(error.errorCode)")
+                UserManager.shared.setUserType(type: .free)
+                failure(error.localizedDescription)
+            }
+        }
+    }
+    
+    // When user click on the restore button
+    func restorePurchases(success: @escaping SuccessCallBack, failure: @escaping ErrorCallBack) {
+        SwiftyStoreKit.restorePurchases(atomically: true) { results in
+            if results.restoreFailedPurchases.count > 0 {
+                debugPrint("Restore Failed: \(results.restoreFailedPurchases)")
+                failure("Restore Failed")
+            } else if results.restoredPurchases.count > 0{
+                self.getReceipts(success: { receipt in
+                    self.verifySubscription(plan: PlanIds.weekly.rawValue, recipt: receipt, success: {
+                        success()
+                    }, failure: { _ in
+                        self.verifyPurchase(plan: PlanIds.lifeTime.rawValue, recipt: receipt, success: {
+                            success()
+                        }, failure: { error in
+                            UserManager.shared.removeUserDetails()
+                            failure(error)
+                        })
+                    })
+                }, failure: { error in
+                    UserManager.shared.setUserType(type: .free)
+                    failure(error)
+                })
+            } else {
+                UserManager.shared.setUserType(type: .free)
+                failure("noPlanToRestore")
+                UserManager.shared.removeUserDetails()
+                self.alertController = AlertController(title: AppConstants.appName.localizeString(), message: Localisation.noPlanToRestore.localizeString())
+                self.alertController?.setBtn(title: Localisation.alertConfirmBtnTitle.localizeString(), handler: { })
+                self.alertController?.showAlertBox()
+            }
+        }
+    }
+    
+    func verifySubscription(plan: String, recipt: ReceiptInfo, success: @escaping SuccessCallBack, failure: @escaping ErrorCallBack){
+        let purchaseResult = SwiftyStoreKit.verifySubscription(ofType: .autoRenewable, productId: plan, inReceipt: recipt)
+        switch purchaseResult {
+        case .purchased(_, let items):
+            UserManager.shared.setUserType(type: .paid)
+            if let purchasedPlan = items.first{
+                UserManager.shared.setPlanId(productId: purchasedPlan.productId)
+            }
+            success()
+            break
+        case .expired(_, let items):
+            UserManager.shared.setUserType(type: .free)
+            debugPrint("The user old purchase was expired \(items.first?.productId ?? "")")
+            failure("The user old purchase was expired")
+            break
+        case .notPurchased:
+            UserManager.shared.setUserType(type: .free)
+            debugPrint("The user has never purchased")
+            failure("The user has never purchased")
+            break
+        }
+    }
+    
+    func verifyPurchase(plan: String, recipt: ReceiptInfo, success: @escaping SuccessCallBack, failure: @escaping ErrorCallBack){
+        let purchaseResult = SwiftyStoreKit.verifyPurchase(productId: plan, inReceipt: recipt)
+        switch purchaseResult {
+        case .purchased(let item):
+            UserManager.shared.setUserType(type: .paid)
+            UserManager.shared.setPlanId(productId: plan)
+            success()
+            break
+        case .notPurchased:
+            UserManager.shared.setUserType(type: .free)
+            failure("The user has never purchased")
+        }
+    }
+    
+    func getReceipts(success: @escaping (ReceiptInfo) -> Void, failure: @escaping ErrorCallBack){
+        let appleValidator = AppleReceiptValidator(service: isTestMode ? .sandbox : .production, sharedSecret: AppConstants.appSharedSecret)
+        SwiftyStoreKit.verifyReceipt(using: appleValidator) { result in
+            switch result {
+            case .success(let receipt):
+                success(receipt)
+            case .error(let error):
+                failure(error.localizedDescription)
+                debugPrint("Receipt Verification Failed: \(error)")
+            }
+        }
+    }
+    
+    // verifyReceipts: To handle auto renewable subscription
+    func verifyReceipts(success: @escaping  SuccessCallBack, failure: @escaping ErrorCallBack){
+        self.getReceipts(success: { receipt in
+            // Verify the purchase of a Subscription
+            if let planId = UserManager.shared.getPlanId() {
+                let planType = PlanIds(rawValue: planId)
+                switch planType {
+                case .weekly:
+                    self.verifySubscription(plan: PlanIds.weekly.rawValue, recipt: receipt, success: {
+                        success()
+                    }, failure: { error in
+                        failure(error)
+                        UserManager.shared.removeUserDetails()
+                    })
+                case .lifeTime:
+                    self.verifyPurchase(plan: PlanIds.lifeTime.rawValue, recipt: receipt, success: {
+                        success()
+                    }, failure: { error in
+                        failure(error)
+                        UserManager.shared.removeUserDetails()
+                    })
+                case nil:
+                    UserManager.shared.removeUserDetails()
+                    UserManager.shared.setUserType(type: .free)
+                    failure("The user has never purchased")
+                }
+            } else {
+                UserManager.shared.removeUserDetails()
+                UserManager.shared.setUserType(type: .free)
+                failure("The user has never purchased")
+            }
+        }, failure: { error in
+            UserManager.shared.removeUserDetails()
+            UserManager.shared.setUserType(type: .free)
+            failure(error)
+        })
+    }
+}
+
+// MARK: Public Methods
+extension IAPManager {
+    func getAvailablePlans() -> [SKProduct] {
+        return availablePlans
+    }
+}
